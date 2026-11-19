@@ -135,6 +135,15 @@ export function handleMcp(
         jsonrpc: '2.0',
         result: {
           supportedVersions: ['2026-07-28', '2025-11-25'],
+          capabilities: {
+            tools: {},
+          },
+          serverInfo: {
+            name: 'github-core-clone',
+            version: '1.0.0',
+          },
+          name: 'github-core-clone',
+          version: '1.0.0',
         },
         id,
       },
@@ -157,6 +166,9 @@ export function handleMcp(
             name: 'github-core-clone',
             version: '1.0.0',
           },
+          // Modern era (2026-07-28+) expects these at result root too
+          name: 'github-core-clone',
+          version: '1.0.0',
         },
         id,
       },

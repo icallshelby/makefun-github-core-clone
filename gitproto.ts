@@ -185,10 +185,7 @@ export function lsRefs(
     result.push({ oid, name: refName, peeled });
   }
 
-  if (result.length === 0 && args.unborn && keep('refs/heads/main')) {
-    result.push({ oid: ZERO_OID, name: 'refs/heads/main', unborn: true });
-  }
-
+  // No synthetic unborn fallback (git native does not advertise unborn refs for empty repos)
   return result;
 }
 

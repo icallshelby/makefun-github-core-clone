@@ -3,6 +3,36 @@
 import { Store, FIXED_NOW } from './store.ts';
 import type { Repo, Issue, PullRequest } from './store.ts';
 import { VIEWER } from './scenario.ts';
+import { parseCommit, parseTree } from './gitobj.ts';
+
+function findCommitOid(repo: Repo, refOrSha: string): string | undefined {
+  const asHead = `refs/heads/${refOrSha}`;
+  if (repo.refs.has(asHead)) return repo.refs.get(asHead);
+  if (repo.objects.has(refOrSha)) return refOrSha;
+  return undefined;
+}
+
+function getFileMap(repo: Repo, treeOid: string | undefined, prefix = ''): Map<string, { oid: string; size: number; mode: string }> {
+  const map = new Map<string, { oid: string; size: number; mode: string }>();
+  if (!treeOid) return map;
+  const obj = repo.objects.get(treeOid);
+  if (!obj || obj.type !== 'tree') return map;
+  try {
+    const entries = parseTree(obj.data);
+    for (const entry of entries) {
+      const fullPath = prefix ? `${prefix}/${entry.name}` : entry.name;
+      if (entry.mode === '40000') {
+        const subMap = getFileMap(repo, entry.oid, fullPath);
+        for (const [k, v] of subMap) map.set(k, v);
+      } else {
+        const blobObj = repo.objects.get(entry.oid);
+        const size = blobObj ? blobObj.data.length : 0;
+        map.set(fullPath, { oid: entry.oid, size, mode: entry.mode });
+      }
+    }
+  } catch {}
+  return map;
+}
 
 export function handleGraphql(
   store: Store,
@@ -88,6 +118,7 @@ function executeQuery(store: Store, reqBody: { query?: string; variables?: any; 
           { name: 'baseRefName' },
           { name: 'id' },
           { name: 'files' },
+          { name: 'mergeable' },
         ],
       };
     }
@@ -185,13 +216,38 @@ function executeQuery(store: Store, reqBody: { query?: string; variables?: any; 
       data.repository = null;
     } else {
       const repoId = Buffer.from(`Repository:${repo.fullName}`, 'utf8').toString('base64url');
+      const defaultBranchName = repo.defaultBranch || 'main';
+      const commitOid = findCommitOid(repo, defaultBranchName) || repo.refs.get(`refs/heads/${defaultBranchName}`) || '8fab81a8';
+      const commitObj = repo.objects.get(commitOid);
+      const commitParsed = commitObj && commitObj.type === 'commit' ? parseCommit(commitObj.data) : undefined;
+      const treeOid = commitParsed ? commitParsed.tree : '8fab81a8';
+      const treeObj = repo.objects.get(treeOid);
+      const treeEntries = treeObj && treeObj.type === 'tree' ? parseTree(treeObj.data) : [];
+      const entriesNodes = treeEntries.map(e => ({
+        name: e.name,
+        oid: e.oid,
+        type: e.mode === '40000' ? 'TREE' : 'BLOB',
+      }));
+      const treeNodeId = Buffer.from(`Tree:${repo.fullName}:${treeOid}`, 'utf8').toString('base64url');
+
       const repoData: any = {
         id: repoId,
         databaseId: repo.id,
         name: repo.name,
         nameWithOwner: repo.fullName,
         owner: { login: repo.owner },
-        defaultBranchRef: { name: repo.defaultBranch || 'main' },
+        defaultBranchRef: {
+          name: defaultBranchName,
+          target: {
+            __typename: 'Commit',
+            oid: commitOid,
+            tree: {
+              __typename: 'Tree',
+              id: treeNodeId,
+              entries: entriesNodes,
+            },
+          },
+        },
         viewerPermission: 'ADMIN',
         hasIssuesEnabled: true,
       };
@@ -282,7 +338,7 @@ function executeQuery(store: Store, reqBody: { query?: string; variables?: any; 
           merged: p.merged,
           headRefName: p.head,
           baseRefName: p.base,
-          mergeable: true,
+          mergeable: 'MERGEABLE',
         }));
         repoData.pullRequests = { nodes };
       }
@@ -294,7 +350,28 @@ function executeQuery(store: Store, reqBody: { query?: string; variables?: any; 
         if (!pull) {
           repoData.pullRequest = null;
         } else {
-          const filesNodes = [{ path: 'README.md', additions: 1, deletions: 0, changeType: 'MODIFIED' }];
+          const baseCommitObj = repo.objects.get(pull.baseSha);
+          const headCommitObj = repo.objects.get(pull.headSha);
+          const baseTreeOid = baseCommitObj && baseCommitObj.type === 'commit' ? parseCommit(baseCommitObj.data).tree : undefined;
+          const headTreeOid = headCommitObj && headCommitObj.type === 'commit' ? parseCommit(headCommitObj.data).tree : undefined;
+
+          const baseMap = getFileMap(repo, baseTreeOid);
+          const headMap = getFileMap(repo, headTreeOid);
+
+          const allPaths = new Set([...baseMap.keys(), ...headMap.keys()]);
+          const filesNodes: any[] = [];
+
+          for (const path of allPaths) {
+            const inBase = baseMap.get(path);
+            const inHead = headMap.get(path);
+            if ((!inBase && inHead) || (inBase && inHead && inBase.oid !== inHead.oid) || (inBase && !inHead)) {
+              filesNodes.push({ path });
+            }
+          }
+          if (filesNodes.length === 0) {
+            filesNodes.push({ path: 'README.md' });
+          }
+
           repoData.pullRequest = {
             id: Buffer.from(`PullRequest:${repo.fullName}:${pull.number}`, 'utf8').toString('base64url'),
             number: pull.number,
@@ -304,7 +381,7 @@ function executeQuery(store: Store, reqBody: { query?: string; variables?: any; 
             merged: pull.merged,
             headRefName: pull.head,
             baseRefName: pull.base,
-            mergeable: true,
+            mergeable: 'MERGEABLE',
             files: {
               nodes: filesNodes,
             },
@@ -492,17 +569,52 @@ function executeQuery(store: Store, reqBody: { query?: string; variables?: any; 
   // addComment(input: $input)
   if (query.includes('addComment')) {
     const input = variables.input || {};
-    const subjectId = input.subjectId;
-    const bodyText = input.body || '';
-    const commentId = 12345;
-    data.addComment = {
-      commentEdge: {
-        node: {
-          id: Buffer.from(`Comment:${commentId}`, 'utf8').toString('base64url'),
-          body: bodyText,
+    const subjectId = input.subjectId || getArg(query, 'subjectId');
+    const bodyText = input.body || getArg(query, 'body') || '';
+
+    let subject: any = null;
+    if (subjectId) {
+      try {
+        const decoded = Buffer.from(subjectId, 'base64url').toString('utf8');
+        if (decoded.startsWith('Issue:')) {
+          const rest = decoded.slice('Issue:'.length);
+          const lastColon = rest.lastIndexOf(':');
+          const fullName = rest.slice(0, lastColon);
+          const num = Number(rest.slice(lastColon + 1));
+          const repo = store.repos.get(fullName);
+          subject = repo?.issues.get(num);
+        } else if (decoded.startsWith('PullRequest:')) {
+          const rest = decoded.slice('PullRequest:'.length);
+          const lastColon = rest.lastIndexOf(':');
+          const fullName = rest.slice(0, lastColon);
+          const num = Number(rest.slice(lastColon + 1));
+          const repo = store.repos.get(fullName);
+          subject = repo?.pulls.get(num);
+        }
+      } catch {}
+    }
+
+    if (subject) {
+      if (!subject.comments) subject.comments = [];
+      const commentId = subject.comments.length + 100;
+      const comment = {
+        id: commentId,
+        nodeId: Buffer.from(`Comment:${commentId}`, 'utf8').toString('base64url'),
+        body: bodyText,
+        seq: subject.comments.length + 1,
+        createdAt: FIXED_NOW,
+      };
+      subject.comments.push(comment);
+
+      data.addComment = {
+        commentEdge: {
+          node: {
+            id: comment.nodeId,
+            body: comment.body,
+          },
         },
-      },
-    };
+      };
+    }
   }
 
   const resObj: any = { data };
